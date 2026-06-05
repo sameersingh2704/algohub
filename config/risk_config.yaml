@@ -1,0 +1,47 @@
+# ============================================================
+# RISK CONFIGURATION — Paper Evaluation Mode
+# Capital is virtual (₹1 crore default). Goal: let all strategies
+# trade freely so we can compare their performance and pick the
+# best one for real-money deployment.
+#
+# HARD limits that are kept:
+#   • max_lots: 1          — exactly 1 lot per trade, always
+#   • min_option_oi        — only trade liquid contracts
+#   • max_spread_pct       — only trade tight-spread contracts
+#   • max_vix              — avoid extreme volatility
+# ============================================================
+
+risk:
+  per_trade:
+    max_risk_pct: 1.0               # Uncapped — paper mode
+    max_premium_exposure_pct: 0.05  # 5% of ₹1cr = ₹50,000 — covers any NIFTY lot easily
+    max_lots: 1                     # HARD LIMIT: exactly 1 lot per trade, no exceptions
+
+  daily:
+    max_loss_pct: 0.50              # Only halt if we lose 50% in a day (never in practice)
+    max_consecutive_losses: 10      # Allow long loss streaks — we need data to evaluate
+    max_trades: 30                  # 10 strategies × up to 3 trades each — plenty of room
+    cooldown_on_limit_hit: false    # Don't pause on limit — keep data flowing
+
+  system:
+    max_drawdown_pct: 0.80          # Circuit breaker only at 80% drawdown — essentially off
+    circuit_breaker_reset: "manual"
+
+  market:
+    max_vix: 30.0                   # Slightly raised — still avoid panic days
+    max_vix_reduced_mode: 35.0
+    min_option_oi: 50000            # Keep — ensures we only trade liquid strikes
+    max_spread_pct: 0.05            # Slightly relaxed — paper mode, no real slippage
+    stale_data_threshold_sec: 30
+    min_liquidity_depth: 200        # Relaxed — paper mode
+
+  kill_switch:
+    enabled: true
+    trigger_file: "/tmp/algo_kill_switch"
+
+  force_exit_triggers:
+    - "API_DISCONNECT_PROLONGED"
+    - "KILL_SWITCH_ACTIVATED"
+    - "CIRCUIT_BREAKER_TRIP"
+    - "STALE_DATA_WITH_POSITION"
+    - "SESSION_END"

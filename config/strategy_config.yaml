@@ -1,0 +1,237 @@
+# ============================================================
+# STRATEGY CONFIGURATION — AVCS v2 (Scalping Edition)
+# Adaptive ORB-VWAP Confluence Scalper
+# ============================================================
+
+strategy:
+  name: "AVCS_v2_Scalp"
+  version: "2.0.0"
+  mode: "PAPER"           # PAPER | LIVE  — ONLY change after full validation
+
+  underlying: "NIFTY"
+  instrument_type: "OPTIDX"
+
+  # Opening Range Breakout parameters
+  orb:
+    start_time: "09:25:00"
+    end_time: "09:35:00"
+    min_range_points: 15      # Below this: narrow ORB (still tradable — often explosive)
+    max_range_points: 100     # Above this: skip day (too wide for reliable R:R)
+    breakout_buffer_points: 3 # Tighter buffer for scalping (was 5)
+    breakout_buffer_pct: 0.03 # 3% of ORB range (was 5%)
+
+  # Entry windows (IST) — three windows for scalp frequency
+  entry_windows:
+    - name: "morning_post_orb"
+      start: "09:35:00"
+      end: "10:45:00"
+    - name: "mid_morning"
+      start: "11:00:00"
+      end: "11:30:00"
+    - name: "afternoon"
+      start: "13:00:00"
+      end: "14:45:00"
+
+  # Midday chop window — no new entries
+  chop_window:
+    start: "11:31:00"
+    end: "12:59:59"
+
+  # VWAP configuration
+  vwap:
+    slope_lookback_bars: 5
+
+  # EMA configuration
+  ema:
+    periods: [5, 13, 21]
+
+  # Volume filter (relaxed for scalp — was 1.5x)
+  volume:
+    confirmation_multiplier: 1.2    # ORB needs 1.2x; VWAP/EMA signals use 0.9x (75% of this)
+    lookback_periods: 20
+
+  # RSI filter (new for v2)
+  rsi:
+    min_for_ce: 45            # RSI must be above 45 for CE (momentum bias)
+    max_for_pe: 55            # RSI must be below 55 for PE
+    overbought: 75            # Don't chase CE when RSI > 75
+    oversold: 25              # Don't chase PE when RSI < 25
+
+  # Option selection
+  options:
+    lot_size: 75              # Updated to current NIFTY lot size
+    strike_interval: 50
+    preferred_delta_min: 0.30  # Accept slightly more OTM for scalp (was 0.35)
+    preferred_delta_max: 0.65
+    max_spread_absolute: 3.0   # Allow slightly wider spread for scalp (was 2.0)
+    max_spread_pct: 0.04       # 4% of mid price (was 3%)
+    min_oi: 50000              # Relaxed — live check; backtest uses volume
+    min_volume_today: 300      # Relaxed for earlier entries (was 500)
+    max_strikes_otm: 1
+
+  # Exit parameters (scalping profile)
+  exits:
+    hard_stop_pct: -0.30           # -30% on premium (was -35% — tighter risk)
+    profit_target_pct: 0.45        # +45% on premium (was +50%)
+    trailing_activation_pct: 0.15  # Activate trail after +15% (was +20%)
+    trailing_stop_pct: 0.12        # Trail 12% below peak (was 15%)
+    intraday_cutoff: "15:15:00"
+    midday_exit_below_pct: 0.05    # Exit midday if < 5% profit (was 10%)
+
+    # Breakeven stop — lock in small gain after quick move
+    breakeven_activation_pct: 0.15 # Move stop to entry+2% after 15% profit
+    breakeven_lock_pct: 0.02       # Lock in 2% gain
+
+    # Partial exit — scalp book partial profits
+    partial_exit_pct: 0.20         # Book partial at +20%
+    first_partial_pct: 0.50        # Sell 50% of position
+
+  # Tuesday expiry gamma mode
+  gamma_mode:
+    enabled: true
+    activate_after: "10:30:00"
+    exit_cutoff: "15:00:00"
+    hard_stop_pct: -0.35
+    profit_target_pct: 0.55
+    trailing_activation_pct: 0.15
+    trailing_stop_pct: 0.15
+    breakeven_activation_pct: 0.15
+    breakeven_lock_pct: 0.02
+    partial_exit_pct: 0.20
+    first_partial_pct: 0.50
+
+  # Regime filter thresholds
+  regime:
+    vix_max_normal: 20.0
+    vix_max_reduced: 25.0
+    cpr_narrow_threshold: 30
+    cpr_wide_threshold: 60
+    gap_shock_threshold: 2.5
+
+  # Consecutive loss cooldown
+  consecutive_loss_halt: 10      # Paper mode — don't halt on losses, collect data
+  max_trades_per_day: 30         # Portfolio-level cap; individual strategies keep their own limits
+
+# ============================================================
+# MULTI-STRATEGY FRAMEWORK — Per-strategy overrides
+# All strategies share the top-level exits/options unless
+# overridden below. Add enabled: false to disable a strategy.
+# ============================================================
+
+strategies:
+
+  # ── Category A: Liquidity / Stop Hunt ──────────────────
+  liquidity_sweep:
+    enabled: true
+    lookback_bars: 20
+    eql_tolerance_pct: 0.001     # 0.1% — bars counted as "equal"
+    proximity_pct: 0.002         # 0.2% approach zone
+    volume_spike_mult: 1.5       # Volume must spike on sweep
+    atr_stop_mult: 0.5           # Stop = 0.5 ATR beyond wick
+    rr_target: 2.0               # 2:1 R:R target
+    max_trades_per_day: 2
+    max_consecutive_losses: 3
+    cooldown_bars: 5
+
+  false_breakout:
+    enabled: true
+    lookback_bars: 20
+    breakout_pct: 0.001          # 0.1% beyond swing to confirm breakout
+    reversal_bars: 3             # Max bars to wait for reversal
+    weak_vol_mult: 0.8           # Volume < 80% avg = weak breakout
+    atr_stop_mult: 0.5
+    max_trades_per_day: 2
+    max_consecutive_losses: 3
+    cooldown_bars: 5
+
+  # ── Category C: Market Structure ───────────────────────
+  bos_retest:
+    enabled: true
+    lookback_bars: 20
+    bos_pct: 0.0015              # 0.15% conviction break
+    retest_zone_pct: 0.002       # 0.2% zone around broken level
+    wick_ratio: 0.5              # Wick must be >50% of bar range
+    rsi_max: 70.0
+    rsi_min: 30.0
+    atr_stop_mult: 0.5
+    rr_min: 2.0
+    max_trades_per_day: 2
+    max_consecutive_losses: 3
+    cooldown_bars: 5
+
+  fair_value_gap:
+    enabled: true
+    min_gap_pct: 0.001           # 0.1% minimum gap size
+    max_age_bars: 10             # FVG must be filled within 10 bars
+    max_trades_per_day: 2
+    max_consecutive_losses: 3
+    cooldown_bars: 5
+
+  # ── Category D: Trend ──────────────────────────────────
+  ema_trend_ride:
+    enabled: true
+    proximity_pct: 0.003         # 0.3% proximity to EMA21 for pullback
+    rsi_min: 40.0
+    rsi_max: 65.0
+    atr_stop_mult: 0.3
+    max_trades_per_day: 2
+    max_consecutive_losses: 3
+    cooldown_bars: 5
+
+  # ── Category E: Mean Reversion ─────────────────────────
+  vwap_mean_reversion:
+    enabled: true
+    extension_pct: 0.008         # 0.8% from VWAP
+    min_extension_bars: 3        # Extended ≥ 3 bars
+    rsi_extreme_ce: 35.0         # Oversold threshold for CE
+    rsi_extreme_pe: 65.0         # Overbought threshold for PE
+    stop_buffer_pct: 0.0025      # 0.25% beyond extension extreme
+    max_trades_per_day: 2
+    max_consecutive_losses: 3
+    cooldown_bars: 5
+
+  bollinger_reversion:
+    enabled: true
+    rsi_overbought: 70.0
+    rsi_oversold: 30.0
+    atr_stop_mult: 0.5
+    max_trades_per_day: 2
+    max_consecutive_losses: 3
+    cooldown_bars: 5
+
+  # ── Category D: Daily Momentum (guaranteed 1 trade/day) ───────────
+  daily_momentum:
+    enabled: true
+    # Phase 1 — ORB Breakout (09:35–10:30)
+    orb_min_range: 15.0             # Ignore tiny opening ranges (noise)
+    orb_max_range: 150.0            # Ignore shock-gap days (handled by regime)
+    orb_buffer: 8.0                 # Armed zone: within 8 pts of ORB boundary
+    orb_vol_mult: 1.2               # Breakout bar must exceed 1.2x avg volume
+    # Phase 2 — VWAP Momentum (10:30–12:30)
+    vwap_min_bars: 3                # Consecutive bars on same VWAP side
+    vwap_pullback_pct: 0.003        # 0.3% pullback toward VWAP to arm
+    # RSI gates
+    rsi_ce_min: 42.0
+    rsi_ce_max: 74.0
+    rsi_pe_min: 26.0
+    rsi_pe_max: 58.0
+    # Risk / sizing
+    atr_stop_mult: 0.5              # Stop = 0.5 × ATR from entry
+    rr_target: 2.0                  # Target = 2:1 R:R
+    # Trade management
+    max_trades_per_day: 1           # Exactly one trade per day from this strategy
+    max_consecutive_losses: 3
+    cooldown_bars: 10
+
+  # ── Category F: Options ────────────────────────────────
+  gamma_pinning:
+    enabled: true                # Tuesday only — enforced in code
+    displacement_pct: 0.005      # 0.5% from max pain to activate
+    min_displacement_bars: 3
+    ema_slope_max: 0.001         # Weak trend threshold
+    pcr_neutral_min: 0.85
+    pcr_neutral_max: 1.15
+    stop_additional_pct: 0.005   # 0.5% further from extreme
+    max_trades_per_day: 1        # One gamma trade per expiry
+    max_consecutive_losses: 2
+    cooldown_bars: 10

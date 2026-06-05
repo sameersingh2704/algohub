@@ -1,0 +1,31 @@
+# ============================================================
+# EXPENSE CONFIGURATION — Indian Options Trading Charges
+# All rates as of 2024. Review quarterly for SEBI/exchange updates.
+# ============================================================
+
+charges:
+  # Angel One flat brokerage for F&O
+  brokerage_flat_per_order: 20.00     # Rs. 20 per executed order
+
+  # STT (Securities Transaction Tax)
+  # Options: 0.05% on SELL side on premium
+  stt_sell_pct: 0.0005
+
+  # NSE Exchange Transaction Charges
+  # Options: 0.053% on premium turnover
+  nse_exchange_txn_pct: 0.00053
+
+  # GST: 18% on (brokerage + exchange transaction charges)
+  gst_pct: 0.18
+
+  # SEBI Regulatory Fee: Rs. 10 per crore of turnover
+  sebi_fee_per_crore: 10.0
+
+  # Stamp Duty: 0.003% on BUY side on premium (buyer pays)
+  stamp_duty_buy_pct: 0.00003
+
+  # DP Charges: Not applicable for options (no demat delivery)
+  dp_charges_per_trade: 0.0
+
+  # IPFT (Investor Protection Fund Trust): 0.001% on premium
+  ipft_pct: 0.000001

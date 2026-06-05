@@ -1,0 +1,71 @@
+# ============================================================
+# SYSTEM CONFIGURATION
+# ============================================================
+
+system:
+  environment: "paper"         # paper | live
+
+  # Market hours (IST)
+  market:
+    open: "09:15:00"
+    close: "15:30:00"
+    pre_market_prep: "09:10:00"
+    hard_close: "15:15:00"
+
+  # Database
+  database:
+    type: "sqlite"              # sqlite | postgresql
+    sqlite_path: "data/trading.db"
+    # For PostgreSQL (production):
+    # host: "localhost"
+    # port: 5432
+    # name: "algo_trading"
+    # user: "algo_user"
+    # password: "DB_PASSWORD_FROM_ENV"
+
+  # Logging
+  logging:
+    level: "INFO"               # DEBUG | INFO | WARNING | ERROR
+    log_dir: "logs"
+    max_file_size_mb: 50
+    backup_count: 10
+    log_ticks: false            # Set true only for debugging — fills disk fast
+
+  # Dashboard
+  dashboard:
+    host: "0.0.0.0"
+    port: 8080
+    enabled: true
+
+  # WebSocket reconnect policy
+  websocket:
+    max_reconnect_attempts: 10
+    reconnect_delay_seconds: 5
+    heartbeat_interval_seconds: 30
+    stale_threshold_seconds: 30
+
+  # API request settings
+  api:
+    request_timeout_seconds: 10
+    max_retries: 3
+    retry_delay_seconds: 2
+    rate_limit_requests_per_second: 5
+
+  # Option chain refresh interval
+  option_chain:
+    refresh_interval_seconds: 60
+
+  # Health check intervals
+  health:
+    check_interval_seconds: 30
+    api_ping_interval_seconds: 60
+
+  # Telegram alerts
+  alerts:
+    enabled: true
+    on_trade_entry: true
+    on_trade_exit: true
+    on_risk_event: true
+    on_circuit_breaker: true
+    daily_summary_time: "15:45:00"
+    morning_prep_time: "09:05:00"

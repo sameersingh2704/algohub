@@ -1,0 +1,48 @@
+# ============================================================
+# MACRO EVENT BLACKOUT CALENDAR
+# System will NOT trade on these dates.
+# Update quarterly. Add next year's dates each December.
+# ============================================================
+
+no_trade_dates:
+  # RBI MPC Meetings 2025 (approximate — confirm at rbi.org.in)
+  - "2025-02-07"
+  - "2025-04-09"
+  - "2025-06-06"
+  - "2025-08-08"
+  - "2025-10-08"
+  - "2025-12-05"
+
+  # Union Budget
+  - "2025-02-01"
+
+  # NSE/BSE Holidays 2025 (update with official NSE holiday list)
+  - "2025-01-26"  # Republic Day
+  - "2025-03-14"  # Holi
+  - "2025-04-14"  # Dr. Ambedkar Jayanti
+  - "2025-04-18"  # Good Friday
+  - "2025-05-01"  # Maharashtra Day
+  - "2025-08-15"  # Independence Day
+  - "2025-10-02"  # Gandhi Jayanti
+  - "2025-10-24"  # Dussehra (approximate)
+  - "2025-11-05"  # Diwali Laxmi Pujan (approximate)
+  - "2025-12-25"  # Christmas
+
+# Dates with elevated caution (trade with reduced size or skip)
+high_risk_dates:
+  # US Fed FOMC meeting dates 2025 (approximate)
+  - "2025-01-29"
+  - "2025-03-19"
+  - "2025-05-07"
+  - "2025-06-18"
+  - "2025-07-30"
+  - "2025-09-17"
+  - "2025-11-05"
+  - "2025-12-17"
+
+  # India Q3/Q4 earnings season heavy days (Reliance, TCS, Infosys, HDFC Bank)
+  # Update based on actual reporting calendar
+  - "2025-01-15"
+  - "2025-01-16"
+  - "2025-04-17"
+  - "2025-04-22"

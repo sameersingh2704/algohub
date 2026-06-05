@@ -1,0 +1,10 @@
+{
+  "trades": 0,
+  "wins": 0,
+  "losses": 0,
+  "win_rate_pct": 0.0,
+  "gross_pnl": 0,
+  "charges": 0,
+  "net_pnl": 0,
+  "avg_net_per_trade": 0.0
+}

@@ -1,0 +1,1 @@
+session_date,symbol,token,direction,strike,expiry,signal_time,entry_time,exit_time,entry_price,exit_price,quantity,exit_reason,gross_pnl,charges,net_pnl,pnl_pct,underlying_at_signal,vwap_at_signal,volume_ratio
