@@ -199,29 +199,30 @@ strategies:
     max_consecutive_losses: 3
     cooldown_bars: 5
 
-  # ── Category D: Daily Momentum (guaranteed 1 trade/day) ───────────
+  # ── Category D: Daily Momentum ────────────────────────
   daily_momentum:
     enabled: true
-    # Phase 1 — ORB Breakout (09:35–10:30)
-    orb_min_range: 15.0             # Ignore tiny opening ranges (noise)
-    orb_max_range: 150.0            # Ignore shock-gap days (handled by regime)
-    orb_buffer: 8.0                 # Armed zone: within 8 pts of ORB boundary
-    orb_vol_mult: 1.2               # Breakout bar must exceed 1.2x avg volume
-    # Phase 2 — VWAP Momentum (10:30–12:30)
-    vwap_min_bars: 3                # Consecutive bars on same VWAP side
-    vwap_pullback_pct: 0.003        # 0.3% pullback toward VWAP to arm
-    # RSI gates
+    orb_min_range: 15.0
+    orb_max_range: 150.0
+    orb_buffer: 8.0
+    orb_vol_mult: 1.2
+    vwap_min_bars: 3
+    vwap_pullback_pct: 0.003
     rsi_ce_min: 42.0
     rsi_ce_max: 74.0
     rsi_pe_min: 26.0
     rsi_pe_max: 58.0
-    # Risk / sizing
-    atr_stop_mult: 0.5              # Stop = 0.5 × ATR from entry
-    rr_target: 2.0                  # Target = 2:1 R:R
-    # Trade management
-    max_trades_per_day: 1           # Exactly one trade per day from this strategy
+    atr_stop_mult: 0.8              # raised from 0.5 — give trade more room
+    rr_target: 2.0
+    max_trades_per_day: 1
     max_consecutive_losses: 3
     cooldown_bars: 10
+    exits:
+      hard_stop_pct: -0.35          # -35% (was -30%)
+      profit_target_pct: 0.70       # +70% (was +45%)
+      trailing_activation_pct: 0.20 # activate trail at +20% (was +15%)
+      trailing_stop_pct: 0.18       # trail 18% below peak (was +12%)
+      partial_exit_pct: 0.30        # partial at +30% (was +20%)
 
   # ── Category F: Options ────────────────────────────────
   gamma_pinning:
@@ -235,3 +236,140 @@ strategies:
     max_trades_per_day: 1        # One gamma trade per expiry
     max_consecutive_losses: 2
     cooldown_bars: 10
+
+  # ── New buy-only strategies ─────────────────────────────
+
+  oi_wall_fade:
+    enabled: true
+    approach_zone_pts: 50.0      # Armed when spot is within 50 pts of OI wall
+    vol_mult: 1.0                # Relaxed — any volume is fine at the wall
+    rsi_min: 30.0
+    rsi_max: 70.0
+    vix_max: 22.0
+    rejection_wick_ratio: 1.5   # Upper/lower wick must be ≥ 1.5× body
+    atr_stop_mult: 0.3           # Tight stop: 0.3×ATR beyond wall
+    atr_target_mult: 1.5
+    max_trades_per_day: 2
+    max_consecutive_losses: 3
+    cooldown_bars: 8
+    exits:
+      hard_stop_pct: -0.30
+      profit_target_pct: 0.60
+      trailing_activation_pct: 0.20
+      trailing_stop_pct: 0.15
+      partial_exit_pct: 0.25
+
+  gap_fill_fade:
+    enabled: true
+    vix_max: 22.0
+    min_bars_before_arm: 2       # Wait 2 bars for momentum to show exhaustion
+    rsi_exhaustion_pe: 40.0      # Gap-up: RSI must be ≥ 40 before fading
+    rsi_exhaustion_ce: 60.0      # Gap-down: RSI must be ≤ 60 before fading
+    max_trades_per_day: 1        # One gap-fill trade per session
+    max_consecutive_losses: 3
+    cooldown_bars: 10
+    exits:
+      hard_stop_pct: -0.30
+      profit_target_pct: 0.65
+      trailing_activation_pct: 0.20
+      trailing_stop_pct: 0.15
+      partial_exit_pct: 0.30
+
+  cpr_breakout:
+    enabled: true
+    cpr_width_max: 40.0          # Only narrow CPR days (strong trending potential)
+    approach_pts: 15.0           # Armed when within 15 pts of TC/BC
+    vol_mult: 1.3                # Volume must expand on breakout
+    rsi_ce_min: 55.0
+    rsi_pe_max: 45.0
+    vix_max: 22.0
+    atr_stop_mult: 0.5
+    rr_target: 2.0
+    max_trades_per_day: 1
+    max_consecutive_losses: 3
+    cooldown_bars: 8
+    exits:
+      hard_stop_pct: -0.30
+      profit_target_pct: 0.70
+      trailing_activation_pct: 0.20
+      trailing_stop_pct: 0.15
+      partial_exit_pct: 0.30
+
+  morning_reversal:
+    enabled: true
+    min_move_pts: 80.0           # Morning move must be ≥ 80 pts for exhaustion
+    min_vwap_dist: 40.0          # Spot must be ≥ 40 pts from VWAP
+    rsi_overbought: 65.0
+    rsi_oversold: 35.0
+    vix_max: 22.0
+    wick_ratio: 1.0              # Reversal wick must be ≥ body size
+    atr_stop_mult: 0.6
+    rr_target: 2.0
+    max_trades_per_day: 1
+    max_consecutive_losses: 3
+    cooldown_bars: 10
+    exits:
+      hard_stop_pct: -0.30
+      profit_target_pct: 0.65
+      trailing_activation_pct: 0.20
+      trailing_stop_pct: 0.15
+      partial_exit_pct: 0.30
+
+  max_pain_convergence:
+    enabled: true
+    min_displacement_pts: 100.0  # Spot must be ≥ 100 pts away from max pain
+    vol_mult: 1.2
+    rsi_ce_min: 45.0
+    rsi_pe_max: 55.0
+    vix_max: 22.0
+    atr_stop_mult: 0.5
+    rr_target: 2.0
+    max_trades_per_day: 1        # One max-pain trade per session
+    max_consecutive_losses: 3
+    cooldown_bars: 10
+    exits:
+      hard_stop_pct: -0.30
+      profit_target_pct: 0.60
+      trailing_activation_pct: 0.20
+      trailing_stop_pct: 0.15
+      partial_exit_pct: 0.25
+
+  pdh_pdl_retest:
+    enabled: true
+    retest_zone_pts: 25.0        # PDH/PDL retest zone: within 25 pts
+    vol_mult: 1.2
+    rsi_ce_min: 42.0
+    rsi_pe_max: 58.0
+    vix_max: 22.0
+    wick_ratio: 1.0
+    atr_stop_mult: 0.5
+    rr_target: 2.5
+    max_trades_per_day: 2        # Can fire on both PDH and PDL
+    max_consecutive_losses: 3
+    cooldown_bars: 8
+    exits:
+      hard_stop_pct: -0.30
+      profit_target_pct: 0.70
+      trailing_activation_pct: 0.20
+      trailing_stop_pct: 0.15
+      partial_exit_pct: 0.30
+
+  vix_spike_buy:
+    enabled: true
+    vix_spike_ratio: 1.15        # VIX must spike ≥ 15% above prev day close
+    vix_abs_min: 15.0            # VIX must be at least 15 (not a quiet day)
+    drop_from_high_pts: 40.0     # NIFTY must be ≥ 40 pts below session high
+    rsi_max_entry: 45.0          # RSI must show bearish momentum
+    vol_mult: 1.3
+    settle_bars_min: 2           # Wait 2 bars of settling after initial spike
+    atr_stop_mult: 0.6
+    rr_target: 2.0
+    max_trades_per_day: 1        # One VIX-spike trade per session
+    max_consecutive_losses: 3
+    cooldown_bars: 12
+    exits:
+      hard_stop_pct: -0.30
+      profit_target_pct: 0.80    # VIX spikes create big premium moves
+      trailing_activation_pct: 0.25
+      trailing_stop_pct: 0.20
+      partial_exit_pct: 0.35

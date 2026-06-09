@@ -757,6 +757,21 @@ class MarketDataEngine:
         tick = self._latest_ticks.get(self._nifty_token)
         return tick.ltp if tick else None
 
+    def get_session_open(self) -> Optional[float]:
+        """Return the open price of the first bar of today's session (9:15 AM candle).
+        Used for regime classification so mid-session restarts don't use the
+        current price as 'today_open', which distorts gap calculations."""
+        if not self._nifty_token:
+            return None
+        today = datetime.now().date()
+        builder = self._bar_builders.get(self._nifty_token)
+        if not builder:
+            return None
+        for bar in builder._completed_bars:
+            if bar.bar_time.date() == today:
+                return bar.open
+        return None
+
     def get_india_vix(self) -> Optional[float]:
         """Return latest India VIX."""
         if not self._vix_token:

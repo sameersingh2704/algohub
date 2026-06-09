@@ -277,6 +277,12 @@ class StrategyManager:
         )
         logger.info(f"Restored open position for {strategy_name}: {trade.symbol} @ ₹{trade.entry_price:.2f}")
 
+    def set_session_context(self, ctx: dict) -> None:
+        """Fan session context (gap, CPR, PDH/PDL, prev_vix) to all strategies."""
+        for strategy in self._strategies.values():
+            strategy.set_session_context(ctx)
+        logger.info(f"StrategyManager: session context injected to {len(self._strategies)} strategies")
+
     def reset_daily(self) -> None:
         """Reset all strategies for new trading day."""
         for strategy in self._strategies.values():

@@ -65,6 +65,13 @@ from core.strategy.strategies.vwap_mean_reversion import VWAPMeanReversion
 from core.strategy.strategies.bollinger_reversion import BollingerReversion
 from core.strategy.strategies.gamma_pinning import GammaPinning
 from core.strategy.strategies.daily_momentum_drive import DailyMomentumDrive
+from core.strategy.strategies.oi_wall_fade import OIWallFade
+from core.strategy.strategies.gap_fill_fade import GapFillFade
+from core.strategy.strategies.cpr_breakout import CPRBreakout
+from core.strategy.strategies.morning_reversal import MorningExhaustionReversal
+from core.strategy.strategies.max_pain_convergence import MaxPainConvergence
+from core.strategy.strategies.pdh_pdl_retest import PDHPDLRetest
+from core.strategy.strategies.vix_spike_buy import VIXSpikeBuy
 from core.execution.paper_simulator import PaperSimulator, SimulationRealism
 from core.execution.order_manager import OrderManager, TradeRecord
 from core.expenses.expense_engine import ExpenseEngine
@@ -363,7 +370,9 @@ class TradingSession:
 
         # Fetch previous day OHLC for CPR
         prev_ohlc = await self._fetch_prev_day_ohlc()
-        today_open = self._md.get_spot_price() or 0.0
+        # Use the actual 9:15 AM open from seeded bars — not current spot —
+        # so mid-session restarts don't produce a different gap/regime.
+        today_open = self._md.get_session_open() or self._md.get_spot_price() or 0.0
         india_vix = self._md.get_india_vix() or 15.0
 
         is_tuesday = self._session_date.weekday() == 1
@@ -379,6 +388,33 @@ class TradingSession:
         )
 
         self._avcs.on_regime_classified(regime)
+
+        # Build session context and fan to all strategies that need it
+        prev_h = prev_ohlc.get("high", today_open)
+        prev_l = prev_ohlc.get("low", today_open)
+        prev_c = prev_ohlc.get("close", today_open)
+        cpr_pivot = (prev_h + prev_l + prev_c) / 3
+        cpr_bc    = (prev_h + prev_l) / 2         # Bottom Central Pivot
+        cpr_tc    = 2 * cpr_pivot - cpr_bc        # Top Central Pivot
+        session_ctx = {
+            "gap_pts":    today_open - prev_c,
+            "gap_pct":    (today_open - prev_c) / prev_c * 100 if prev_c > 0 else 0.0,
+            "prev_close": prev_c,
+            "prev_high":  prev_h,
+            "prev_low":   prev_l,
+            "cpr_pivot":  round(cpr_pivot, 2),
+            "cpr_tc":     round(cpr_tc, 2),
+            "cpr_bc":     round(cpr_bc, 2),
+            "session_open": today_open,
+            "prev_vix":   india_vix,   # best proxy available at session start
+            "is_tuesday": is_tuesday,
+        }
+        self._strategy_manager.set_session_context(session_ctx)
+        logger.info(
+            f"Session context: gap={session_ctx['gap_pts']:+.1f} pts "
+            f"CPR BC={cpr_bc:.2f} TC={cpr_tc:.2f} "
+            f"PDH={prev_h:.2f} PDL={prev_l:.2f} VIX={india_vix:.2f}"
+        )
 
         # Send morning prep alert
         await self._alerts.send_morning_prep(
@@ -1183,6 +1219,20 @@ async def main(args) -> None:
         all_strategies.append(GammaPinning(_scfg("gamma_pinning"), risk_cfg))
     if strategies_cfg.get("daily_momentum", {}).get("enabled", True):
         all_strategies.append(DailyMomentumDrive(_scfg("daily_momentum"), risk_cfg))
+    if strategies_cfg.get("oi_wall_fade", {}).get("enabled", True):
+        all_strategies.append(OIWallFade(_scfg("oi_wall_fade"), risk_cfg))
+    if strategies_cfg.get("gap_fill_fade", {}).get("enabled", True):
+        all_strategies.append(GapFillFade(_scfg("gap_fill_fade"), risk_cfg))
+    if strategies_cfg.get("cpr_breakout", {}).get("enabled", True):
+        all_strategies.append(CPRBreakout(_scfg("cpr_breakout"), risk_cfg))
+    if strategies_cfg.get("morning_reversal", {}).get("enabled", True):
+        all_strategies.append(MorningExhaustionReversal(_scfg("morning_reversal"), risk_cfg))
+    if strategies_cfg.get("max_pain_convergence", {}).get("enabled", True):
+        all_strategies.append(MaxPainConvergence(_scfg("max_pain_convergence"), risk_cfg))
+    if strategies_cfg.get("pdh_pdl_retest", {}).get("enabled", True):
+        all_strategies.append(PDHPDLRetest(_scfg("pdh_pdl_retest"), risk_cfg))
+    if strategies_cfg.get("vix_spike_buy", {}).get("enabled", True):
+        all_strategies.append(VIXSpikeBuy(_scfg("vix_spike_buy"), risk_cfg))
 
     portfolio_risk = PortfolioRisk(risk_cfg, account_capital, lot_size)
     execution_selector = ExecutionSelector(strategy_cfg)
@@ -1338,8 +1388,12 @@ async def main(args) -> None:
         dashboard_task: Optional[asyncio.Task] = None
         if config["system"]["dashboard"].get("enabled", False):
             import uvicorn
+            import socket as _socket
 
             dash_cfg = config["system"]["dashboard"]
+            _dash_port = int(dash_cfg.get("port", 8080))
+            _dash_host = dash_cfg.get("host", "0.0.0.0")
+
             dashboard_app = create_dashboard_app(
                 market_data=market_data,
                 order_manager=order_manager,
@@ -1351,25 +1405,43 @@ async def main(args) -> None:
             dashboard_server = uvicorn.Server(
                 uvicorn.Config(
                     dashboard_app,
-                    host=dash_cfg.get("host", "0.0.0.0"),
-                    port=int(dash_cfg.get("port", 8080)),
+                    host=_dash_host,
+                    port=_dash_port,
                     log_level="warning",
                 )
             )
+
+            def _on_dashboard_done(task: asyncio.Task) -> None:
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc:
+                    logger.error("Dashboard crashed: %s", exc, exc_info=exc)
+                    print(f"\n  [ERROR] Dashboard crashed: {exc}\n")
+
             dashboard_task = asyncio.create_task(dashboard_server.serve())
-            _dash_port = int(dash_cfg.get("port", 8080))
-            try:
-                import socket
-                _local_ip = socket.gethostbyname(socket.gethostname())
-            except Exception:
-                _local_ip = "0.0.0.0"
-            logger.info(
-                "Dashboard → local: http://localhost:%s  |  network: http://%s:%s",
-                _dash_port, _local_ip, _dash_port,
-            )
-            print(f"\n  Dashboard running:")
-            print(f"    Local   → http://localhost:{_dash_port}")
-            print(f"    Network → http://{_local_ip}:{_dash_port}\n")
+            dashboard_task.add_done_callback(_on_dashboard_done)
+
+            # Give uvicorn a moment to bind the port before printing the URL
+            await asyncio.sleep(0.5)
+            if dashboard_task.done():
+                exc = dashboard_task.exception()
+                logger.error("Dashboard failed to start: %s", exc)
+                print(f"\n  [ERROR] Dashboard failed to start: {exc}")
+                print(f"  → Is port {_dash_port} already in use? Try: lsof -i :{_dash_port}\n")
+                dashboard_task = None
+            else:
+                try:
+                    _local_ip = _socket.gethostbyname(_socket.gethostname())
+                except Exception:
+                    _local_ip = "0.0.0.0"
+                logger.info(
+                    "Dashboard → local: http://localhost:%s  |  network: http://%s:%s",
+                    _dash_port, _local_ip, _dash_port,
+                )
+                print(f"\n  Dashboard running:")
+                print(f"    Local   → http://localhost:{_dash_port}")
+                print(f"    Network → http://{_local_ip}:{_dash_port}\n")
 
         # Run trading session
         session_task = asyncio.create_task(session.run())

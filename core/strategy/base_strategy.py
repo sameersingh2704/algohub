@@ -123,6 +123,8 @@ class BaseStrategy(ABC):
         # When True, this strategy runs even on NO_TRADE regime days.
         # Use only for evaluation/testing strategies that need end-to-end validation.
         self.regime_exempt: bool = False
+        # Injected once per session before market open (CPR, gap, PDH/PDL, prev_vix).
+        self._session_ctx: dict = {}
 
     # ── Public interface ─────────────────────────────────────────────────────
 
@@ -284,6 +286,53 @@ class BaseStrategy(ABC):
         """Register an option symbol → token mapping."""
         self._option_registry[symbol] = token
         self._option_registry[token] = symbol  # reverse lookup
+
+    def set_session_context(self, ctx: dict) -> None:
+        """Inject session-level data: gap_pts, prev_close, prev_high, prev_low,
+        cpr_tc, cpr_bc, session_open, prev_vix. Called once from _pre_session_prep."""
+        self._session_ctx = ctx
+        logger.debug(f"{self.name}: session context set — {list(ctx.keys())}")
+
+    def _standard_exit_check(
+        self, ms: MarketState, option_price: float, pos: PositionState,
+        time_stop_hhmm: tuple = (15, 0),
+    ) -> Optional[ExitDecision]:
+        """Common trailing-stop / target / time-stop exit logic for all strategies."""
+        if option_price <= 0:
+            return None
+        exits = self._config.get("exits", {})
+        hard_stop_pct           = exits.get("hard_stop_pct", -0.30)
+        profit_target_pct       = exits.get("profit_target_pct", 0.60)
+        trailing_activation_pct = exits.get("trailing_activation_pct", 0.20)
+        trailing_stop_pct       = exits.get("trailing_stop_pct", 0.15)
+        partial_exit_pct        = exits.get("partial_exit_pct", 0.25)
+
+        pnl_pct = (option_price - pos.entry_price) / pos.entry_price
+        if option_price > pos.peak_price:
+            pos.peak_price = option_price
+
+        if pnl_pct <= hard_stop_pct:
+            return ExitDecision(action="EXIT", reason="HARD_STOP")
+        if pnl_pct >= profit_target_pct:
+            return ExitDecision(action="EXIT", reason="PROFIT_TARGET")
+
+        if pnl_pct >= trailing_activation_pct:
+            pos.breakeven_activated = True
+        if pos.breakeven_activated:
+            trail_stop = pos.peak_price * (1.0 - trailing_stop_pct)
+            if option_price <= trail_stop:
+                return ExitDecision(action="EXIT", reason="TRAILING_STOP")
+
+        if pnl_pct >= partial_exit_pct and not pos.partial_exit_done:
+            return ExitDecision(
+                action="PARTIAL", reason="PARTIAL_TARGET",
+                partial_quantity=max(1, pos.quantity // 2),
+            )
+
+        if (ms.timestamp.hour, ms.timestamp.minute) >= time_stop_hhmm:
+            return ExitDecision(action="EXIT", reason="TIME_STOP")
+
+        return None
 
     def reset_daily(self) -> None:
         """Reset daily counters. Call at session start."""
