@@ -1,1 +1,0 @@
-event_type,timestamp,trade_id,strategy,symbol,option_type,strike,expiry,lots,quantity,entry_time,entry_price,entry_spot,exit_time,exit_price,gross_pnl,charges,net_pnl,pnl_pct,exit_reason,hold_min,signal_reason

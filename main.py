@@ -1128,6 +1128,36 @@ async def _seed_indicators_today(
 
 # ─── Main Entry Point ──────────────────────────────────────
 
+def _get_lan_ips() -> list[str]:
+    """Return all LAN IPv4 addresses this machine is reachable on."""
+    import socket as _sock
+    ips: list[str] = []
+
+    # Primary: UDP connect trick — finds the interface used to reach the internet
+    try:
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        s.settimeout(0)
+        s.connect(("8.8.8.8", 80))
+        primary = s.getsockname()[0]
+        s.close()
+        if primary and not primary.startswith("127."):
+            ips.append(primary)
+    except Exception:
+        pass
+
+    # Fallback: enumerate all interfaces via getaddrinfo
+    try:
+        for family, _, _, _, sockaddr in _sock.getaddrinfo(_sock.gethostname(), None):
+            if family == _sock.AF_INET:
+                ip = sockaddr[0]
+                if not ip.startswith("127.") and ip not in ips:
+                    ips.append(ip)
+    except Exception:
+        pass
+
+    return ips
+
+
 async def main(args) -> None:
     """System entrypoint. Initializes all components and runs session."""
     # Load config
@@ -1431,17 +1461,21 @@ async def main(args) -> None:
                 print(f"  → Is port {_dash_port} already in use? Try: lsof -i :{_dash_port}\n")
                 dashboard_task = None
             else:
-                try:
-                    _local_ip = _socket.gethostbyname(_socket.gethostname())
-                except Exception:
-                    _local_ip = "0.0.0.0"
+                _lan_ips = _get_lan_ips()
                 logger.info(
-                    "Dashboard → local: http://localhost:%s  |  network: http://%s:%s",
-                    _dash_port, _local_ip, _dash_port,
+                    "Dashboard → local: http://localhost:%s  |  network IPs: %s",
+                    _dash_port, _lan_ips,
                 )
-                print(f"\n  Dashboard running:")
-                print(f"    Local   → http://localhost:{_dash_port}")
-                print(f"    Network → http://{_local_ip}:{_dash_port}\n")
+                print(f"\n{'─'*52}")
+                print(f"  Dashboard running on port {_dash_port}")
+                print(f"{'─'*52}")
+                print(f"  This machine  → http://localhost:{_dash_port}")
+                for ip in _lan_ips:
+                    print(f"  Other devices → http://{ip}:{_dash_port}")
+                if not _lan_ips:
+                    print(f"  Other devices → (could not detect LAN IP)")
+                    print(f"  Tip: run 'ifconfig | grep inet' to find your IP")
+                print(f"{'─'*52}\n")
 
         # Run trading session
         session_task = asyncio.create_task(session.run())

@@ -106,8 +106,10 @@ class WebSocketHandler:
     - last_tick_age(): Seconds since last tick received
     """
 
-    MAX_RECONNECT_ATTEMPTS = 10
-    RECONNECT_BASE_DELAY = 5
+    MAX_RECONNECT_ATTEMPTS = 10      # attempts in first pass before long-retry mode
+    RECONNECT_BASE_DELAY = 30        # first retry after 30s (was 5 — too aggressive)
+    RECONNECT_MAX_DELAY = 300        # cap at 5 min per attempt (was 120)
+    RECONNECT_LONG_RETRY_DELAY = 600 # after exhausting fast retries, retry every 10 min
     HEARTBEAT_INTERVAL = 30
     STALE_THRESHOLD_SECONDS = 30
     MODE_FULL = 3  # Full market data mode (LTP + OHLC + depth + OI)
@@ -169,7 +171,23 @@ class WebSocketHandler:
         logger.info("WebSocket connection initiated")
 
     def _create_ws_client(self) -> None:
-        """Create and configure SmartWebSocketV2 client."""
+        """Create and configure SmartWebSocketV2 client.
+
+        Always closes the previous connection before creating a new one so
+        Angel One's server-side connection count doesn't accumulate across
+        restarts — which triggers their 429 'Connection Limit Exceeded' error.
+        """
+        # Close previous connection so Angel One drops the server-side socket
+        # before we open a new one. Without this, every reconnect burns one of
+        # Angel One's per-key connection slots and quickly triggers 429.
+        if self._ws is not None:
+            try:
+                self._ws.close_connection()
+            except Exception:
+                pass
+            self._ws = None
+            time.sleep(1)   # brief pause so the close reaches Angel One's server
+
         session = self._auth.current_session
 
         self._ws = SmartWebSocketV2(
@@ -219,7 +237,15 @@ class WebSocketHandler:
 
     def _on_error(self, ws, error) -> None:
         """Called on WebSocket error."""
-        logger.error(f"WebSocket error: {error}")
+        err_str = str(error).lower()
+        if "429" in err_str or "too many requests" in err_str or "connection limit" in err_str:
+            logger.warning(
+                f"WebSocket rate-limited by Angel One (429). "
+                f"Will retry every {self.RECONNECT_LONG_RETRY_DELAY}s. "
+                f"No action needed — app will auto-recover when limit resets."
+            )
+        else:
+            logger.error(f"WebSocket error: {error}")
 
     def _on_close(self, ws) -> None:
         """
@@ -230,7 +256,8 @@ class WebSocketHandler:
         here directly — it will raise RuntimeError: "no running event loop".
         Use loop.call_soon_threadsafe() to schedule work on the correct loop.
         """
-        logger.warning("WebSocket disconnected")
+        if not self._closing:
+            logger.warning("WebSocket disconnected")
         self._connected = False
 
         for cb in self._disconnect_callbacks:
@@ -416,16 +443,33 @@ class WebSocketHandler:
                 logger.error(f"Re-subscription error for exchangeType={ex_type}: {e}")
 
     async def _reconnect_loop(self) -> None:
-        """Exponential backoff reconnect loop. Only one instance runs at a time."""
+        """
+        Reconnect loop that never permanently gives up.
+
+        Phase 1 — exponential backoff (30s → 300s) for up to MAX_RECONNECT_ATTEMPTS.
+        Phase 2 — if all Phase-1 attempts fail (e.g. 429 rate-limit from Angel One),
+                   keep retrying every RECONNECT_LONG_RETRY_DELAY seconds until the
+                   session ends. This prevents the app from dying on a temporary
+                   Angel One connection-limit error.
+        """
         if self._reconnect_task and not self._reconnect_task.done():
             return  # already reconnecting
 
         self._reconnect_task = asyncio.current_task()
         try:
+            # ── Phase 1: exponential backoff ─────────────────────────────
             for attempt in range(1, self.MAX_RECONNECT_ATTEMPTS + 1):
-                delay = min(self.RECONNECT_BASE_DELAY * (2 ** (attempt - 1)), 120)
-                logger.info(f"Reconnect attempt {attempt}/{self.MAX_RECONNECT_ATTEMPTS} in {delay}s")
+                delay = min(
+                    self.RECONNECT_BASE_DELAY * (2 ** (attempt - 1)),
+                    self.RECONNECT_MAX_DELAY,
+                )
+                logger.info(
+                    f"WebSocket reconnect attempt {attempt}/{self.MAX_RECONNECT_ATTEMPTS} "
+                    f"in {delay}s"
+                )
                 await asyncio.sleep(delay)
+                if self._closing:
+                    return
 
                 try:
                     await self._auth.ensure_authenticated()
@@ -436,7 +480,34 @@ class WebSocketHandler:
                 except Exception as e:
                     logger.error(f"Reconnect attempt {attempt} failed: {e}")
 
-            logger.critical("All WebSocket reconnect attempts exhausted — manual intervention needed")
+            # ── Phase 2: long-retry mode (never give up) ─────────────────
+            # Reaches here when Angel One is rate-limiting (HTTP 429 / connection
+            # limit exceeded). Keep trying every 10 minutes until the session ends.
+            logger.warning(
+                f"Phase-1 reconnects exhausted — switching to long-retry mode "
+                f"(every {self.RECONNECT_LONG_RETRY_DELAY}s). "
+                f"Possible Angel One connection-limit (429). App will auto-recover."
+            )
+            long_attempt = 0
+            while not self._closing:
+                long_attempt += 1
+                logger.info(
+                    f"WebSocket long-retry attempt {long_attempt} "
+                    f"in {self.RECONNECT_LONG_RETRY_DELAY}s"
+                )
+                await asyncio.sleep(self.RECONNECT_LONG_RETRY_DELAY)
+                if self._closing:
+                    return
+
+                try:
+                    await self._auth.ensure_authenticated()
+                    self._create_ws_client()
+                    self._reconnect_count += 1
+                    logger.info(f"WebSocket long-retry succeeded (attempt {long_attempt})")
+                    return
+                except Exception as e:
+                    logger.error(f"Long-retry attempt {long_attempt} failed: {e}")
+
         finally:
             self._reconnect_task = None
 
