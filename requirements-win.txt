@@ -1,0 +1,35 @@
+# Windows / Python 3.13 compatible requirements
+# Only packages actually used by live trading (main.py + core/)
+# Excludes: ta-lib, pandas, backtrader, sqlalchemy (not used in live trading)
+
+# Core
+python-dotenv>=1.0
+pyyaml>=6.0
+pyotp>=2.9
+
+# Angel One SmartAPI
+smartapi-python>=1.4.1
+logzero>=1.7
+websocket-client>=1.7
+
+# Data / Math  (numpy 2.x + scipy 1.15.x have Python 3.13 wheels)
+numpy>=2.0
+pandas>=2.2
+scipy>=1.13
+
+# API / Dashboard
+fastapi>=0.109
+uvicorn>=0.27
+httpx>=0.26
+
+# Async HTTP
+aiohttp>=3.9
+
+# Monitoring
+psutil>=5.9
+
+# Market data (crypto / commodities / global indices for dashboard watchlist)
+yfinance>=0.2
+
+# Telegram alerts (optional -- gracefully disabled if missing)
+python-telegram-bot>=20.7

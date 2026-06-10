@@ -114,6 +114,15 @@ class RunningState:
     extension_bars_below: int = 0
     bb_outside_dir: Optional[str] = None
 
+    # Supertrend(ATR-10, mult 2.5) — for SupertrendVWAP strategy
+    st_atr_avg: Optional[float] = None
+    st_atr_prev_close: Optional[float] = None
+    st_atr_warmup: int = 0
+    st_final_upper: float = 0.0
+    st_final_lower: float = 0.0
+    st_trend: int = 0            # +1 bullish, -1 bearish, 0 uninit
+    st_bars_since_flip: int = 0
+
     # Day-level counters
     bars_today: int = 0
 
@@ -199,6 +208,42 @@ def update_indicators(state: RunningState, bar: Bar) -> None:
             state.atr_avg = state.atr_avg * (13/14) + tr * (1/14)
             state.atr = state.atr_avg
     state.atr_prev_close = price
+
+    # Supertrend(10, 2.5)
+    if state.st_atr_prev_close is not None:
+        tr_st = max(bar.high - bar.low,
+                    abs(bar.high - state.st_atr_prev_close),
+                    abs(bar.low  - state.st_atr_prev_close))
+        state.st_atr_warmup += 1
+        if state.st_atr_warmup <= 10:
+            state.st_atr_avg = (state.st_atr_avg or 0.0) + tr_st
+            if state.st_atr_warmup == 10:
+                state.st_atr_avg /= 10
+        else:
+            state.st_atr_avg = state.st_atr_avg * (9 / 10) + tr_st * (1 / 10)
+    state.st_atr_prev_close = price
+
+    if state.st_atr_warmup >= 10:
+        hl2 = (bar.high + bar.low) / 2
+        raw_upper = hl2 + 2.5 * state.st_atr_avg
+        raw_lower = hl2 - 2.5 * state.st_atr_avg
+        if state.st_final_upper == 0.0:
+            state.st_final_upper = raw_upper
+            state.st_final_lower = raw_lower
+        else:
+            state.st_final_upper = (min(raw_upper, state.st_final_upper)
+                                    if bar.close <= state.st_final_upper else raw_upper)
+            state.st_final_lower = (max(raw_lower, state.st_final_lower)
+                                    if bar.close >= state.st_final_lower else raw_lower)
+        prev_st_trend = state.st_trend
+        if state.st_trend <= 0:
+            state.st_trend = 1 if bar.close > state.st_final_upper else -1
+        else:
+            state.st_trend = -1 if bar.close < state.st_final_lower else 1
+        if state.st_trend != prev_st_trend and prev_st_trend != 0:
+            state.st_bars_since_flip = 0
+        else:
+            state.st_bars_since_flip += 1
 
     # Bollinger Bands (20, 2σ)
     state.bb_prices.append(price)
@@ -288,6 +333,21 @@ def _ema_scalp_signal(bar: Bar, state: RunningState, direction: str) -> bool:
         return cross and state.ema9 > state.vwap and 40 <= state.rsi <= 75
     cross = state.ema5 < state.ema13 and state.prev_ema9_above_ema21 is True
     return cross and state.ema9 < state.vwap and 25 <= state.rsi <= 60
+
+
+def _supertrend_vwap_signal(bar: Bar, state: RunningState, direction: str) -> bool:
+    """SupertrendVWAP Momentum Scalper — enters on Supertrend flip confirmed by VWAP + RSI."""
+    if state.st_atr_warmup < 10 or state.st_trend == 0:
+        return False
+    if state.vwap <= 0:
+        return False
+    if state.st_bars_since_flip > 3:
+        return False
+    if state.vol_ratio < 1.2:
+        return False
+    if direction == "CE":
+        return state.st_trend == 1 and bar.close > state.vwap and 45 <= state.rsi <= 68
+    return state.st_trend == -1 and bar.close < state.vwap and 32 <= state.rsi <= 55
 
 
 def _liquidity_sweep_signal(bar: Bar, state: RunningState) -> Optional[str]:
@@ -627,6 +687,7 @@ STRATEGY_NAMES = [
     "VWAPMeanReversion",
     "BollingerReversion",
     "GammaPinning",
+    "SupertrendVWAP",
 ]
 
 # ── Backtest engine ───────────────────────────────────────────────────────────
@@ -662,6 +723,7 @@ class MultiStrategyBacktester:
             "VWAPMeanReversion": "vwap_mean_reversion",
             "BollingerReversion": "bollinger_reversion",
             "GammaPinning": "gamma_pinning",
+            "SupertrendVWAP": "supertrend_vwap",
         }
         for sname in STRATEGY_NAMES:
             cfg_key = _name_map.get(sname)
@@ -793,6 +855,13 @@ class MultiStrategyBacktester:
         bb_dir = _bollinger_signal(bar, state, pending["BollingerReversion"])
         if bb_dir:
             try_enter("BollingerReversion", bb_dir, "BOLLINGER_REVERSION")
+
+        # SupertrendVWAP (entry window: 9:35–14:30)
+        if dtime(9, 35) <= t <= dtime(14, 30):
+            for d in ("CE", "PE"):
+                if _supertrend_vwap_signal(bar, state, d):
+                    try_enter("SupertrendVWAP", d, "SUPERTREND_VWAP")
+                    break
 
         # GammaPinning (Tuesday only, 10:30+)
         # Uses index spot for ATM (options priced on index); futures for displacement signal

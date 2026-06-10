@@ -246,10 +246,9 @@ class OrderManager:
         )
         trade.total_charges = charges.total_charges
         trade.net_pnl = trade.gross_pnl - trade.total_charges
-        trade.pnl_pct = (
-            (trade.exit_price - trade.entry_price) / trade.entry_price
-            if trade.entry_price > 0 else 0.0
-        )
+        # Net-based pct: sign always matches net_pnl — no "green % but red ₹" confusion
+        capital = trade.entry_price * trade.quantity
+        trade.pnl_pct = trade.net_pnl / capital if capital > 0 else 0.0
 
         # Move to closed
         del self._open_trades[trade_id]
@@ -366,10 +365,8 @@ class OrderManager:
         except Exception:
             trade.total_charges = 0.0
         trade.net_pnl = trade.gross_pnl - trade.total_charges
-        trade.pnl_pct = (
-            (trade.exit_price - trade.entry_price) / trade.entry_price
-            if trade.entry_price > 0 else 0.0
-        )
+        capital = trade.entry_price * trade.quantity
+        trade.pnl_pct = trade.net_pnl / capital if capital > 0 else 0.0
 
         del self._open_trades[trade_id]
         if trade.strategy_name in self._strategy_positions:

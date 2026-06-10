@@ -1440,8 +1440,8 @@ async def main(args) -> None:
                     _dash_port, _local_ip, _dash_port,
                 )
                 print(f"\n  Dashboard running:")
-                print(f"    Local   → http://localhost:{_dash_port}")
-                print(f"    Network → http://{_local_ip}:{_dash_port}\n")
+                print(f"    Local   -> http://localhost:{_dash_port}")
+                print(f"    Network -> http://{_local_ip}:{_dash_port}\n")
 
         # Run trading session
         session_task = asyncio.create_task(session.run())

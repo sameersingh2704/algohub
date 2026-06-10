@@ -20,6 +20,7 @@ import csv
 import glob
 import os
 import uuid
+import yaml
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -30,6 +31,29 @@ from fastapi.responses import HTMLResponse
 
 # Folder where per-day trade CSVs live (relative to CWD = project root)
 _TRADES_DIR = Path("data/live_trades")
+_STRATEGY_CONFIG_PATH = Path("config/strategy_config.yaml")
+
+# Supported underlyings
+SUPPORTED_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+
+# yfinance-backed watch symbols  (yf_ticker, display_name, currency_prefix)
+YFINANCE_SYMBOLS: dict = {
+    "BTC":    ("BTC-USD",  "Bitcoin",   "$"),
+    "ETH":    ("ETH-USD",  "Ethereum",  "$"),
+    "SOL":    ("SOL-USD",  "Solana",    "$"),
+    "BNB":    ("BNB-USD",  "BNB",       "$"),
+    "XRP":    ("XRP-USD",  "XRP",       "$"),
+    "GOLD":   ("GC=F",     "Gold",      "$"),
+    "SILVER": ("SI=F",     "Silver",    "$"),
+    "CRUDE":  ("CL=F",     "Crude Oil", "$"),
+    "SPX":    ("^GSPC",    "S&P 500",   ""),
+    "NASDAQ": ("^IXIC",    "NASDAQ",    ""),
+    "US30":   ("^DJI",     "Dow Jones", ""),
+    "USDINR": ("USDINR=X", "USD/INR",   ""),
+}
+
+_yf_cache: dict = {}
+_YF_CACHE_TTL   = 12  # seconds
 
 
 # ── Serialisation helper ──────────────────────────────────────────────────────
@@ -120,6 +144,14 @@ def create_dashboard_app(
             quote = market_data.get_option_quote(trade.token) if hasattr(market_data, "get_option_quote") else None
             ltp = quote.ltp if quote and quote.ltp > 0 else trade.entry_price
             unreal_gross = (ltp - trade.entry_price) * trade.quantity
+            # Estimated net if exited right now: exit fills at bid (~0.5% below LTP)
+            # and incurs charges (flat ₹40 brokerage + ~0.1% STT/exchange on turnover).
+            bid_est   = ltp * 0.995
+            chg_est   = 40.0 + (trade.entry_price + bid_est) * trade.quantity * 0.00053 \
+                        + bid_est * trade.quantity * 0.0005 + 18.0  # exchange + STT + GST approx
+            est_net   = (bid_est - trade.entry_price) * trade.quantity - chg_est
+            capital   = trade.entry_price * trade.quantity
+            est_net_pct = round(est_net / capital * 100, 1) if capital > 0 else 0
             open_positions.append({
                 "symbol":      trade.symbol,
                 "strategy":    trade.strategy_name or "—",
@@ -130,6 +162,8 @@ def create_dashboard_app(
                 "ltp":         round(ltp, 2),
                 "unreal_pnl":  round(unreal_gross, 2),
                 "unreal_pct":  round((ltp / trade.entry_price - 1) * 100, 1) if trade.entry_price else 0,
+                "est_net_pnl": round(est_net, 2),
+                "est_net_pct": est_net_pct,
                 "entry_time":  trade.entry_time.strftime("%H:%M:%S") if trade.entry_time else "",
                 "entry_spot":  round(trade.entry_spot, 2),
                 "signal":      trade.signal_reason or "",
@@ -641,6 +675,110 @@ def create_dashboard_app(
             "strategies":    strategies,
         }
 
+
+    # ── Symbol config ─────────────────────────────────────────────────────────
+
+    @app.get("/api/get-symbol")
+    async def get_symbol() -> dict:
+        """Return the current trading underlying from strategy_config.yaml."""
+        try:
+            with open(_STRATEGY_CONFIG_PATH) as f:
+                cfg = yaml.safe_load(f)
+            return {"symbol": cfg.get("strategy", {}).get("underlying", "NIFTY")}
+        except Exception as e:
+            return {"symbol": "NIFTY", "error": str(e)}
+
+    @app.post("/api/set-symbol")
+    async def set_symbol(body: dict) -> dict:
+        """Update the trading underlying in strategy_config.yaml. Restart required."""
+        symbol = (body.get("symbol") or "").strip().upper()
+        if symbol not in SUPPORTED_SYMBOLS:
+            return {"ok": False, "error": "Invalid symbol. Choose from: " + str(SUPPORTED_SYMBOLS)}
+        try:
+            with open(_STRATEGY_CONFIG_PATH) as f:
+                raw = f.read()
+            lines = []
+            for line in raw.splitlines():
+                stripped = line.lstrip()
+                if stripped.startswith("underlying:") and "name:" not in line:
+                    indent = len(line) - len(stripped)
+                    lines.append(" " * indent + 'underlying: "' + symbol + '"')
+                else:
+                    lines.append(line)
+            with open(_STRATEGY_CONFIG_PATH, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            return {"ok": True, "symbol": symbol, "message": "Config updated. Restart the bot to apply."}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.get("/api/yfinance-quote")
+    async def yfinance_quote(symbol: str = Query("BTC")) -> dict:
+        import asyncio, time as _time
+        sym  = symbol.upper()
+        info = YFINANCE_SYMBOLS.get(sym)
+        if not info:
+            return {"error": f"Unknown symbol: {sym}"}
+        ticker_code = info[0]
+        now = _time.time()
+        if sym in _yf_cache and (now - _yf_cache[sym][0]) < _YF_CACHE_TTL:
+            return _yf_cache[sym][1]
+        def _fetch_sync() -> dict:
+            try:
+                import yfinance as yf
+                import pandas as pd
+                from datetime import date as _date
+                t    = yf.Ticker(ticker_code)
+                hist = t.history(period="2d", interval="5m")
+                if hist.empty:
+                    return {"error": "No data", "symbol": sym}
+                closes = hist["Close"].tolist()
+                highs  = hist["High"].tolist()
+                lows   = hist["Low"].tolist()
+                vols   = hist["Volume"].tolist()
+                today  = _date.today()
+                today_i = [i for i, ts in enumerate(hist.index) if ts.date() >= today]
+                if today_i:
+                    tc = [closes[i] for i in today_i]
+                    th = max(highs[i] for i in today_i)
+                    tl = min(lows[i]  for i in today_i)
+                    tv = int(sum(vols[i] for i in today_i))
+                else:
+                    tc = closes[-20:]; th = max(highs[-20:]); tl = min(lows[-20:]); tv = int(sum(vols[-20:]))
+                cur    = tc[-1] if tc else closes[-1]
+                open_p = tc[0]  if tc else cur
+                chg    = ((cur - open_p) / open_p * 100) if open_p else 0.0
+                recent = closes[-60:]
+                def _ema(prices, n):
+                    if len(prices) < n: return float(prices[-1]) if prices else 0.0
+                    return float(pd.Series(prices).ewm(span=n, adjust=False).mean().iloc[-1])
+                def _rsi(prices, n=14):
+                    if len(prices) <= n: return 50.0
+                    s = pd.Series(prices); dd = s.diff()
+                    g = dd.clip(lower=0).rolling(n).mean(); ll = (-dd.clip(upper=0)).rolling(n).mean()
+                    rs = g.iloc[-1] / (ll.iloc[-1] or 1e-9)
+                    return float(100 - 100 / (1 + rs))
+                dp = 4 if cur < 10 else (2 if cur < 1000 else 0)
+                return {
+                    "symbol": sym, "ticker": ticker_code,
+                    "price":      round(cur,    dp),
+                    "open":       round(open_p, dp),
+                    "high":       round(th,     dp),
+                    "low":        round(tl,     dp),
+                    "change_pct": round(chg,    2),
+                    "volume":     tv,
+                    "rsi":        round(_rsi(recent),    1),
+                    "ema9":       round(_ema(recent,  9), dp),
+                    "ema21":      round(_ema(recent, 21), dp),
+                    "ema50":      round(_ema(recent, 50), dp),
+                    "sparkline":  [round(p, dp) for p in tc[-30:]],
+                    "currency":   info[2],
+                }
+            except Exception as ex:
+                return {"error": str(ex), "symbol": sym}
+        data = await asyncio.to_thread(_fetch_sync)
+        _yf_cache[sym] = (_time.time(), data)
+        return data
+
     # ── HTML ──────────────────────────────────────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
@@ -749,6 +887,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--ui-font);font-size
 .topbar-badge{padding:2px 9px;border-radius:var(--rs);font-size:9px;font-weight:800;letter-spacing:1px;
   text-transform:uppercase;background:var(--blue-bg);color:var(--blue-lt);
   border:1px solid rgba(45,124,246,.3);flex-shrink:0}
+.badge-watch{background:rgba(251,146,60,.12)!important;color:#fb923c!important;border-color:rgba(251,146,60,.3)!important}
 .topbar-divider{width:1px;height:20px;background:var(--border2);flex-shrink:0}
 .topbar-item{color:var(--text2);font-size:12px;white-space:nowrap}
 .topbar-right{margin-left:auto;display:flex;align-items:center;gap:10px;flex-shrink:0}
@@ -756,6 +895,16 @@ body{background:var(--bg);color:var(--text);font-family:var(--ui-font);font-size
 .live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);
   margin-right:6px;box-shadow:0 0 6px var(--green);animation:livepulse 2s ease-in-out infinite}
 @keyframes livepulse{0%,100%{opacity:1;box-shadow:0 0 6px var(--green)}50%{opacity:.4;box-shadow:0 0 2px var(--green)}}
+.symbol-switcher{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.symbol-label{font-size:10px;font-weight:700;letter-spacing:.8px;color:var(--text3);text-transform:uppercase}
+.symbol-select{background:var(--surface2);color:var(--blue-lt);border:1px solid rgba(45,124,246,.4);
+  border-radius:6px;padding:4px 10px;font-size:12px;font-weight:700;letter-spacing:.5px;
+  cursor:pointer;outline:none;appearance:none;-webkit-appearance:none;padding-right:22px}
+.symbol-select:hover{border-color:var(--blue-lt)}
+.symbol-restart-badge{display:none;padding:2px 8px;border-radius:4px;font-size:9px;font-weight:800;
+  letter-spacing:.8px;text-transform:uppercase;background:rgba(251,191,36,.12);
+  color:#fbbf24;border:1px solid rgba(251,191,36,.3);animation:badgepulse 1.5s ease-in-out infinite}
+@keyframes badgepulse{0%,100%{opacity:1}50%{opacity:.5}}
 
 /* ══════════════════════════════════════════════
    BUTTONS
@@ -885,12 +1034,42 @@ select:hover,select:focus{border-color:var(--blue)}
 </head>
 <body>
 <nav class="topbar">
-  <span class="topbar-logo">NIFTY ALGO</span>
-  <span class="topbar-badge">PAPER</span>
+  <span class="topbar-logo" id="topbar-logo">NIFTY ALGO</span>
+  <span class="topbar-badge" id="mode-badge">PAPER</span>
   <span class="topbar-divider"></span>
   <div class="tab-nav">
     <button class="tab-btn active" onclick="showTab('live',this)">Live</button>
     <button class="tab-btn" onclick="showTab('history',this)">History</button>
+  </div>
+  <span class="topbar-divider"></span>
+  <div class="symbol-switcher">
+    <span class="symbol-label">Symbol</span>
+    <select class="symbol-select" id="symbol-select" onchange="changeSymbol(this.value)">
+      <optgroup label="Indian Markets">
+        <option value="NIFTY">NIFTY 50</option>
+        <option value="BANKNIFTY">BANK NIFTY</option>
+        <option value="FINNIFTY">FIN NIFTY</option>
+      </optgroup>
+      <optgroup label="Crypto">
+        <option value="BTC">Bitcoin (BTC)</option>
+        <option value="ETH">Ethereum (ETH)</option>
+        <option value="SOL">Solana (SOL)</option>
+        <option value="BNB">BNB</option>
+        <option value="XRP">XRP</option>
+      </optgroup>
+      <optgroup label="Commodities">
+        <option value="GOLD">Gold</option>
+        <option value="SILVER">Silver</option>
+        <option value="CRUDE">Crude Oil</option>
+      </optgroup>
+      <optgroup label="Global Markets">
+        <option value="SPX">S&amp;P 500</option>
+        <option value="NASDAQ">NASDAQ</option>
+        <option value="US30">Dow Jones</option>
+        <option value="USDINR">USD / INR</option>
+      </optgroup>
+    </select>
+    <span class="symbol-restart-badge" id="restart-badge">&#8635; Restart</span>
   </div>
   <span class="topbar-divider"></span>
   <span class="topbar-item" id="t-session">—</span>
@@ -960,6 +1139,9 @@ select:hover,select:focus{border-color:var(--blue)}
       <div class="mcard-sub" id="m-feed-sub">—</div>
     </div>
   </div>
+  <div id="watch-banner" style="display:none;padding:6px 18px;background:rgba(251,146,60,.07);border-bottom:1px solid rgba(251,146,60,.18);font-size:12px;color:#fb923c">
+    👁 Watch Mode — live price via yFinance &nbsp;·&nbsp; NIFTY options algo continues running in the background
+  </div>
 
   <div class="main-grid">
     <div class="main-left">
@@ -989,7 +1171,7 @@ select:hover,select:focus{border-color:var(--blue)}
 
     <div style="min-width:0">
       <div class="card" style="height:100%">
-        <div class="card-title">Strategies</div>
+        <div class="card-title" id="strat-card-title">Strategies</div>
         <div class="table-wrap">
           <table>
             <thead><tr>
@@ -1024,8 +1206,9 @@ select:hover,select:focus{border-color:var(--blue)}
           <th>Strategy</th><th>Symbol</th><th>Side</th>
           <th style="text-align:right">Entry ₹</th>
           <th style="text-align:right">LTP ₹</th>
-          <th style="text-align:right">Unreal P&amp;L</th>
-          <th style="text-align:right">Chg %</th>
+          <th style="text-align:right">Gross P&amp;L</th>
+          <th style="text-align:right">Gross %</th>
+          <th style="text-align:right">Est Net</th>
           <th>Time In</th><th>Signal</th><th></th>
         </tr></thead>
         <tbody id="open-body"></tbody>
@@ -1181,6 +1364,266 @@ const set = (id, html, isHTML=false) => {
   else el.textContent = html;
 };
 
+
+// ── symbol switcher ──────────────────────────────────────────────────────────
+const YFINANCE_KEYS = new Set(['BTC','ETH','SOL','BNB','XRP','GOLD','SILVER','CRUDE','SPX','NASDAQ','US30','USDINR']);
+const SYMBOL_LOGOS = {
+  NIFTY:'NIFTY ALGO', BANKNIFTY:'BANK ALGO', FINNIFTY:'FIN ALGO',
+  BTC:'BTC WATCH', ETH:'ETH WATCH', SOL:'SOL WATCH', BNB:'BNB WATCH', XRP:'XRP WATCH',
+  GOLD:'GOLD WATCH', SILVER:'SILVER WATCH', CRUDE:'CRUDE WATCH',
+  SPX:'SPX WATCH', NASDAQ:'NASDAQ WATCH', US30:'US30 WATCH', USDINR:'USD/INR WATCH',
+};
+const SYMBOL_CURRENCY = {
+  BTC:'$', ETH:'$', SOL:'$', BNB:'$', XRP:'$',
+  GOLD:'$', SILVER:'$', CRUDE:'$', SPX:'', NASDAQ:'', US30:'', USDINR:'',
+};
+// market class → per-class RSI thresholds (crypto is more volatile)
+const MARKET_TYPE = {
+  BTC:'crypto', ETH:'crypto', SOL:'crypto', BNB:'crypto', XRP:'crypto',
+  GOLD:'commodity', SILVER:'commodity', CRUDE:'commodity',
+  SPX:'global', NASDAQ:'global', US30:'global', USDINR:'global',
+};
+const MARKET_PARAMS = {
+  default:   { rsi_ob:70, rsi_os:30, rsi_bull:55, rsi_bear:45 },
+  crypto:    { rsi_ob:75, rsi_os:25, rsi_bull:57, rsi_bear:43 },
+  commodity: { rsi_ob:72, rsi_os:28, rsi_bull:55, rsi_bear:45 },
+  global:    { rsi_ob:70, rsi_os:30, rsi_bull:55, rsi_bear:45 },
+};
+
+let _activeSym  = 'NIFTY';
+let _isYFinance = false;
+let _yfLastMs   = 0;
+let _yfData     = null;
+
+function _updateModeUI(sym) {
+  const isYF = YFINANCE_KEYS.has(sym);
+  const logo = G('topbar-logo');
+  if (logo) logo.textContent = SYMBOL_LOGOS[sym] || sym + ' ALGO';
+  const badge = G('mode-badge');
+  if (badge) {
+    badge.textContent = isYF ? 'WATCH' : 'PAPER';
+    badge.className   = 'topbar-badge' + (isYF ? ' badge-watch' : '');
+  }
+  const banner = G('watch-banner');
+  if (banner) banner.style.display = isYF ? 'block' : 'none';
+  const ct = G('strat-card-title');
+  if (ct) ct.textContent = isYF ? ('Signals \xB7 ' + sym) : 'Strategies';
+}
+
+async function loadCurrentSymbol() {
+  try {
+    const r = await fetch('/api/get-symbol');
+    const d = await r.json();
+    const sym = d.symbol || 'NIFTY';
+    _activeSym = sym; _isYFinance = YFINANCE_KEYS.has(sym);
+    const sel = G('symbol-select');
+    if (sel) sel.value = sym;
+    _updateModeUI(sym);
+  } catch(e) {}
+}
+
+async function changeSymbol(sym) {
+  _activeSym = sym; _isYFinance = YFINANCE_KEYS.has(sym);
+  _yfData = null; _yfLastMs = 0;
+  _updateModeUI(sym);
+  if (_isYFinance) {
+    const rb = G('restart-badge'); if (rb) rb.style.display = 'none';
+    _fetchYFQuote(); return;
+  }
+  try {
+    const r = await fetch('/api/set-symbol', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({symbol: sym})
+    });
+    const d = await r.json();
+    if (d.ok) { const rb = G('restart-badge'); if (rb) rb.style.display = 'inline-block'; }
+    else alert('Error: ' + (d.error || 'Unknown error'));
+  } catch(e) { alert('Failed to update symbol: ' + e); }
+}
+
+async function _fetchYFQuote() {
+  if (!_isYFinance) return;
+  const now = Date.now();
+  if (_yfData && (now - _yfLastMs) < 12000) { _applyYFDisplay(); return; }
+  try {
+    const r = await fetch('/api/yfinance-quote?symbol=' + encodeURIComponent(_activeSym));
+    if (!r.ok) return;
+    _yfData = await r.json(); _yfLastMs = Date.now();
+    _applyYFDisplay();
+  } catch(e) { console.warn('yfinance:', e); }
+}
+
+function _applyYFDisplay() {
+  if (!_yfData || _yfData.error || !_isYFinance) return;
+  const d = _yfData, cur = d.currency || '', p = d.price || 0, pct = d.change_pct || 0;
+  const fmtYF = v => {
+    if (v == null || v !== v) return '—';
+    if (v >= 10000) return cur + Math.round(v).toLocaleString('en-US');
+    if (v >= 100)   return cur + Number(v).toFixed(2);
+    if (v >= 1)     return cur + Number(v).toFixed(4);
+    return cur + Number(v).toFixed(6);
+  };
+  const spotEl = G('m-spot');
+  if (spotEl) { spotEl.textContent = fmtYF(p); spotEl.className = 'mcard-val num ' + (pct >= 0 ? 'c-green' : 'c-red'); }
+  set('m-spot-sub', (pct >= 0 ? '+' : '') + pct.toFixed(2) + '% today');
+  set('m-vwap', fmtYF(d.high || 0));
+  G('m-vwap-sub').innerHTML = '<span class="c-red">Low: ' + fmtYF(d.low || 0) + '</span>';
+  const rsi = d.rsi || 50, rsiEl = G('m-rsi');
+  const mp = MARKET_PARAMS[MARKET_TYPE[_activeSym]||'default'] || MARKET_PARAMS.default;
+  if (rsiEl) { rsiEl.textContent = rsi.toFixed(1); rsiEl.className = 'mcard-val num ' + (rsi > mp.rsi_ob ? 'c-red' : rsi < mp.rsi_os ? 'c-green' : ''); }
+  set('m-rsi-sub', rsi > mp.rsi_ob ? '⚠ Overbought (>'+mp.rsi_ob+')' : rsi < mp.rsi_os ? '⚠ Oversold (<'+mp.rsi_os+')' : 'Neutral');
+  // ATR: avg absolute change over last 14 5-min bars from sparkline
+  const _sp = d.sparkline || [];
+  let _atr = 0;
+  if (_sp.length >= 2) {
+    const diffs = [];
+    for (let i = 1; i < _sp.length; i++) diffs.push(Math.abs(_sp[i] - _sp[i-1]));
+    const last14 = diffs.slice(-Math.min(14, diffs.length));
+    _atr = last14.reduce((a, b) => a + b, 0) / last14.length;
+  }
+  G('m-atr').textContent = _atr > 0 ? fmtYF(_atr) : (d.high && d.low ? fmtYF((d.high - d.low) / 14) : '—');
+  const e9 = d.ema9, e21 = d.ema21, e50 = d.ema50;
+  if (e9 && e21 && e50) {
+    G('m-ema').innerHTML = '<span class="' + (e9>e21?'c-green':'c-red') + '">' + fmtYF(e9) + '</span>' +
+      '<span class="c-dim"> / </span>' + fmtYF(e21) + '<span class="c-dim"> / </span>' + fmtYF(e50);
+    const tr = e9>e21&&e21>e50 ? '▲ Bullish' : e9<e21&&e21<e50 ? '▼ Bearish' : '↔ Mixed';
+    G('m-ema-sub').innerHTML = '<span class="' + (e9>e21?'c-green':'c-red') + '">' + tr + '</span>';
+  }
+  set('m-bb', 'Open: ' + fmtYF(d.open || 0)); set('m-bb-sub', '24h open price');
+  G('m-vix').textContent = '—'; G('m-vix').className = 'mcard-val num'; set('m-vix-sub', 'n/a');
+  G('m-orb').textContent = fmtYF((d.high||0) - (d.low||0));
+  G('m-orb-sub').innerHTML = '<span class="c-cyan">DAY RANGE</span>';
+  const volEl = G('m-vol'), v = d.volume || 0;
+  if (volEl) {
+    volEl.textContent = v>1e9?(v/1e9).toFixed(2)+'B':v>1e6?(v/1e6).toFixed(2)+'M':v>1e3?(v/1e3).toFixed(1)+'K':String(v);
+    volEl.className = 'mcard-val num';
+  }
+  const feedEl = G('m-feed');
+  if (feedEl) { feedEl.textContent = 'yFinance'; feedEl.className = 'mcard-val c-cyan'; }
+  set('m-feed-sub', 'market watch');
+  if (d.sparkline && d.sparkline.length > 1) {
+    const base = d.sparkline[0]; drawEquity(d.sparkline.map(sv => sv - base));
+  }
+  // strategy table → computed signals from yfinance indicators
+  const stratTitle = G('strat-card-title');
+  if (stratTitle) stratTitle.textContent = 'Signals \xB7 ' + _activeSym + ' (Watch Mode)';
+  G('strat-body').innerHTML = _computeYFSignals(d, _activeSym).map(s => {
+    const cls = s.signal==='LONG'?'c-green':s.signal==='SHORT'?'c-red':'c-muted';
+    const ic  = s.signal==='LONG'?'▲':s.signal==='SHORT'?'▼':'—';
+    const cc  = s.conf>=65?'c-green':s.conf>=50?'c-yellow':'c-muted';
+    return '<tr>' +
+      '<td><span style="font-weight:600;font-size:12px">' + s.name + '</span></td>' +
+      '<td><span class="' + cls + '" style="font-weight:700">' + ic + ' ' + s.signal + '</span></td>' +
+      '<td class="num" style="text-align:right"><span class="' + cc + '">' + s.conf + '%</span></td>' +
+      '<td style="text-align:right"><span class="' + cls + '">' + ic + '</span></td>' +
+      '<td class="c-muted num" style="text-align:right">—</td>' +
+      '<td class="c-dim" style="font-size:11px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + s.reason + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+// ── yfinance watch-mode signal engine ────────────────────────────────────────
+// 9 generic strategies; NSE-specific ones (CPR, OIWall, GammaPin, MaxPain,
+// GapFill, MorningExhaustion, PDH/PDL, VIXSpike) are hidden in watch mode.
+function _computeYFSignals(d, sym) {
+  const mType = MARKET_TYPE[sym] || 'default';
+  const p     = MARKET_PARAMS[mType] || MARKET_PARAMS.default;
+  const price = d.price||0, open = d.open||price;
+  const high  = d.high||price, low = d.low||price;
+  const rsi   = d.rsi||50,    pct = d.change_pct||0;
+  const e9    = d.ema9||price, e21 = d.ema21||price, e50 = d.ema50||price;
+  const spark = d.sparkline||[];
+
+  const emaBull  = e9>e21&&e21>e50, emaBear  = e9<e21&&e21<e50;
+  const rsiOB    = rsi>p.rsi_ob,    rsiOS    = rsi<p.rsi_os;
+  const rsiBull  = rsi>p.rsi_bull,  rsiBear  = rsi<p.rsi_bear;
+  const aboveE21 = price>e21;
+
+  let bbU = high*1.01, bbL = low*0.99;
+  if (spark.length >= 10) {
+    const mn = spark.reduce((a,b)=>a+b,0)/spark.length;
+    const sd = Math.sqrt(spark.reduce((a,b)=>a+(b-mn)**2,0)/spark.length);
+    bbU = mn+2*sd; bbL = mn-2*sd;
+  }
+  const s = (name,signal,conf,reason) => ({name,signal,conf,reason});
+
+  return [
+    // EMATrendRide
+    (()=>{
+      if(emaBull&&rsiBull) return s('EMATrendRide','LONG', 72,'EMA bullish stack + RSI '+rsi.toFixed(0)+' > '+p.rsi_bull);
+      if(emaBear&&rsiBear) return s('EMATrendRide','SHORT',72,'EMA bearish stack + RSI '+rsi.toFixed(0)+' < '+p.rsi_bear);
+      if(emaBull)          return s('EMATrendRide','LONG', 55,'EMA9 > EMA21 > EMA50 bullish alignment');
+      if(emaBear)          return s('EMATrendRide','SHORT',55,'EMA9 < EMA21 < EMA50 bearish alignment');
+      return s('EMATrendRide','NEUTRAL',35,'No clear EMA stack alignment');
+    })(),
+    // SupertrendVWAP
+    (()=>{
+      if(e9>e21&&aboveE21&&rsi>45&&!rsiOB) return s('SupertrendVWAP','LONG', 65,'EMA cross up + above EMA21 + RSI '+rsi.toFixed(0));
+      if(e9<e21&&!aboveE21&&rsi<55&&!rsiOS) return s('SupertrendVWAP','SHORT',65,'EMA cross down + below EMA21 + RSI '+rsi.toFixed(0));
+      return s('SupertrendVWAP','NEUTRAL',30,'No supertrend confirmation signal');
+    })(),
+    // BollingerReversion
+    (()=>{
+      if(price>bbU&&rsiOB) return s('BollingerReversion','SHORT',74,'Above BB upper + RSI '+rsi.toFixed(0)+' OB threshold '+p.rsi_ob+' → fade');
+      if(price<bbL&&rsiOS) return s('BollingerReversion','LONG', 74,'Below BB lower + RSI '+rsi.toFixed(0)+' OS threshold '+p.rsi_os+' → fade');
+      if(price>bbU)        return s('BollingerReversion','SHORT',50,'Price above Bollinger upper band');
+      if(price<bbL)        return s('BollingerReversion','LONG', 50,'Price below Bollinger lower band');
+      return s('BollingerReversion','NEUTRAL',30,'Within Bollinger Bands, no signal');
+    })(),
+    // VWAPMeanReversion (EMA21 as VWAP proxy)
+    (()=>{
+      const dist = e21>0?(price-e21)/e21:0;
+      const ext  = mType==='crypto'?0.008:0.005;
+      if(dist> ext&&rsiOB) return s('VWAPMeanReversion','SHORT',69,'+' +(dist*100).toFixed(1)+'% above EMA21 + overbought RSI '+rsi.toFixed(0));
+      if(dist<-ext&&rsiOS) return s('VWAPMeanReversion','LONG', 69,   (dist*100).toFixed(1)+'% below EMA21 + oversold RSI '+rsi.toFixed(0));
+      if(dist> ext*.6)     return s('VWAPMeanReversion','SHORT',44,'Extended +'+(dist*100).toFixed(1)+'% from EMA21 (VWAP proxy)');
+      if(dist<-ext*.6)     return s('VWAPMeanReversion','LONG', 44,'Extended ' +(dist*100).toFixed(1)+'% from EMA21 (VWAP proxy)');
+      return s('VWAPMeanReversion','NEUTRAL',30,'Near EMA21 — no mean reversion signal');
+    })(),
+    // DailyMomentumDrive
+    (()=>{
+      const mm = mType==='crypto'?2.0:0.8;
+      if(pct> mm&&emaBull&&rsiBull) return s('DailyMomentumDrive','LONG', 73,'+'+pct.toFixed(1)+'% day move + EMA + RSI bullish confluence');
+      if(pct<-mm&&emaBear&&rsiBear) return s('DailyMomentumDrive','SHORT',73,   pct.toFixed(1)+'% day move + EMA + RSI bearish confluence');
+      if(pct> mm*.5&&emaBull)       return s('DailyMomentumDrive','LONG', 52,'+'+pct.toFixed(1)+'% momentum + EMA bullish');
+      if(pct<-mm*.5&&emaBear)       return s('DailyMomentumDrive','SHORT',52,   pct.toFixed(1)+'% momentum + EMA bearish');
+      return s('DailyMomentumDrive','NEUTRAL',30,'Insufficient directional momentum');
+    })(),
+    // BOSRetest
+    (()=>{
+      const bm = mType==='crypto'?0.008:0.004;
+      const ratio = open>0?(price-open)/open:0;
+      if(ratio> bm&&emaBull) return s('BOSRetest','LONG', 58,'+'+(ratio*100).toFixed(1)+'% above open + EMA bullish structure');
+      if(ratio<-bm&&emaBear) return s('BOSRetest','SHORT',58,   (ratio*100).toFixed(1)+'% below open + EMA bearish structure');
+      return s('BOSRetest','NEUTRAL',30,'No significant structure break from open');
+    })(),
+    // FairValueGap
+    (()=>{
+      const fg = mType==='crypto'?1.5:0.8;
+      if(pct> fg&&rsi<60) return s('FairValueGap','LONG', 55,'Bullish gap +'+pct.toFixed(1)+'%, RSI '+rsi.toFixed(0)+' not extended');
+      if(pct<-fg&&rsi>40) return s('FairValueGap','SHORT',55,'Bearish gap '+pct.toFixed(1)+'%, RSI '+rsi.toFixed(0)+' not extended');
+      return s('FairValueGap','NEUTRAL',30,'No significant gap from open price');
+    })(),
+    // LiquiditySweepReversal
+    (()=>{
+      const rng = high-low||1;
+      const fH  = (high-price)/rng, fL = (price-low)/rng;
+      if(fH<0.12&&rsiOB) return s('LiquiditySweepReversal','SHORT',63,'Within '+(fH*100).toFixed(0)+'% of day high + RSI '+rsi.toFixed(0)+' overbought');
+      if(fL<0.12&&rsiOS) return s('LiquiditySweepReversal','LONG', 63,'Within '+(fL*100).toFixed(0)+'% of day low + RSI '+rsi.toFixed(0)+' oversold');
+      return s('LiquiditySweepReversal','NEUTRAL',30,'Not at a daily liquidity extreme');
+    })(),
+    // FalseBreakoutTrap
+    (()=>{
+      const rng = high-low||1, pos = (price-low)/rng;
+      if(pos>0.88&&rsiOB) return s('FalseBreakoutTrap','SHORT',61,'At '+(pos*100).toFixed(0)+'% of day range + overbought → trap risk');
+      if(pos<0.12&&rsiOS) return s('FalseBreakoutTrap','LONG', 61,'At '+(pos*100).toFixed(0)+'% of day range + oversold → trap risk');
+      return s('FalseBreakoutTrap','NEUTRAL',30,'No false breakout pattern detected');
+    })(),
+  ];
+}
+
+loadCurrentSymbol();
+
 // ── clock ────────────────────────────────────────────────────────────────────
 setInterval(() => {
   G('topbar-clock').textContent = new Date().toLocaleTimeString('en-IN',
@@ -1261,6 +1704,7 @@ async function refresh() {
   set('t-last', new Date(d.ts).toLocaleTimeString('en-IN',{hour12:false}));
 
   // ── market strip ────────────────────────────────────────────────────────
+  if (!_isYFinance) {
   const m = d.market || {};
   const spot = safe(m.spot), vwap = safe(m.vwap);
 
@@ -1323,6 +1767,7 @@ async function refresh() {
   feedEl.textContent = fresh ? 'LIVE' : 'STALE';
   feedEl.className = 'mcard-val '+(fresh?'c-green':'c-red');
   set('m-feed-sub', `tick ${safe(d.health?.tick_age_sec).toFixed(1)}s ago`);
+  } // end !_isYFinance market strip
 
   // ── WS status ──────────────────────────────────────────────────────────
   const wsOk = d.health?.ws_alive;
@@ -1363,6 +1808,7 @@ async function refresh() {
   G('s-kill').innerHTML = '<span class="c-green">OFF</span>';
 
   // ── strategy table ──────────────────────────────────────────────────────
+  if (!_isYFinance) {
   const strats = d.strategies || [];
   G('strat-body').innerHTML = strats.length
     ? strats.map(st => {
@@ -1378,6 +1824,7 @@ async function refresh() {
         </tr>`;
       }).join('')
     : '<tr><td colspan="6" class="empty">No strategies loaded</td></tr>';
+  } // end !_isYFinance strategy table
 
   // ── open positions ───────────────────────────────────────────────────────
   const op = d.open_positions || [];
@@ -1396,16 +1843,17 @@ async function refresh() {
           <td class="num" style="text-align:right">₹${fmtN(p.ltp)}</td>
           <td style="text-align:right">${fmtPnl(p.unreal_pnl)}</td>
           <td style="text-align:right">${pnlPct(upct)}</td>
+          <td style="text-align:right" title="Est. net after bid-spread + charges">${fmtPnl(p.est_net_pnl)}</td>
           <td class="c-muted">${p.entry_time||'—'}</td>
           <td class="c-dim" style="font-size:11px;max-width:140px;overflow:hidden;text-overflow:ellipsis">${p.signal||'—'}</td>
           <td><button class="btn btn-red" style="padding:3px 8px;font-size:10px"
             onclick="forceExit('${p.strategy}',this)">Force Exit</button></td>
         </tr>`;
       }).join('')
-    : '<tr><td colspan="9" class="empty">No open positions</td></tr>';
+    : '<tr><td colspan="10" class="empty">No open positions</td></tr>';
 
   // ── equity curve ─────────────────────────────────────────────────────────
-  drawEquity(d.equity_curve);
+  if (!_isYFinance) drawEquity(d.equity_curve);
 
   // ── closed trades ────────────────────────────────────────────────────────
   const ct = d.closed_trades || [];
@@ -1428,6 +1876,9 @@ async function refresh() {
         </tr>`;
       }).join('')
     : '<tr><td colspan="10" class="empty">No closed trades yet</td></tr>';
+
+  // overlay yfinance data when watching a non-Angel One symbol
+  if (_isYFinance) _fetchYFQuote();
 }
 
 // ── test trade buttons ────────────────────────────────────────────────────────

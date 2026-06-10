@@ -320,6 +320,11 @@ class BaseStrategy(ABC):
             pos.breakeven_activated = True
         if pos.breakeven_activated:
             trail_stop = pos.peak_price * (1.0 - trailing_stop_pct)
+            # Floor: never let trailing stop drop below entry + lock-in buffer.
+            # Prevents exits at a loss when trail_stop_pct >= trailing_activation_pct
+            # (e.g. gamma_mode activation=15%, trail=15% → trail at entry×0.9775).
+            breakeven_lock_pct = exits.get("breakeven_lock_pct", 0.02)
+            trail_stop = max(trail_stop, pos.entry_price * (1.0 + breakeven_lock_pct))
             if option_price <= trail_stop:
                 return ExitDecision(action="EXIT", reason="TRAILING_STOP")
 

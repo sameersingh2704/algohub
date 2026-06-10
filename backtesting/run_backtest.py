@@ -117,10 +117,14 @@ class RunningState:
 
     # EMA5 cross history (last 5 bars: True = EMA5 > EMA13)
     ema5_above_13: Deque = None
+    # Last 5 RSI values — used to filter EMA_SCALP for directional momentum
+    rsi_history: Deque = None
 
     def __post_init__(self):
         if self.ema5_above_13 is None:
             self.ema5_above_13 = deque(maxlen=6)
+        if self.rsi_history is None:
+            self.rsi_history = deque(maxlen=5)
 
 
 class CandleStore:
@@ -293,6 +297,7 @@ class AVCSBacktester:
 
             # — Update RSI(14) ───────────────────────────────────
             update_rsi(state, bar.close)
+            state.rsi_history.append(state.rsi)
 
             # — Track EMA5 cross history ─────────────────────────
             state.ema5_above_13.append(state.ema_5 > state.ema_13)
@@ -468,23 +473,30 @@ class AVCSBacktester:
                 return "PE", "VWAP_BOUNCE"
 
         # ─── EMA SCALP ────────────────────────────────
-        if vol_ok_soft and len(state.ema5_above_13) >= 4:
+        # Tightened: volume raised to 1.3× and RSI must be trending directionally
+        vol_ok_ema_scalp = state.volume_ratio >= 1.3
+        if vol_ok_ema_scalp and len(state.ema5_above_13) >= 4:
             hist = list(state.ema5_above_13)
             freshly_bullish = hist[-1] and not hist[-4]  # crossed up in last 3 bars
             freshly_bearish = not hist[-1] and hist[-4]  # crossed down in last 3 bars
+            rsi_hist = list(state.rsi_history)
+            rsi_rising  = len(rsi_hist) >= 4 and (state.rsi - rsi_hist[-4]) >= 1.5
+            rsi_falling = len(rsi_hist) >= 4 and (rsi_hist[-4] - state.rsi) >= 1.5
 
             if (freshly_bullish
                     and spot > state.vwap
                     and state.vwap_slope > 0
                     and state.ema_5 > state.ema_13 > state.ema_21
-                    and rsi_min_ce <= state.rsi <= rsi_ob):
+                    and rsi_min_ce <= state.rsi <= rsi_ob
+                    and rsi_rising):
                 return "CE", "EMA_SCALP"
 
             if (freshly_bearish
                     and spot < state.vwap
                     and state.vwap_slope < 0
                     and state.ema_5 < state.ema_13 < state.ema_21
-                    and rsi_os <= state.rsi <= rsi_max_pe):
+                    and rsi_os <= state.rsi <= rsi_max_pe
+                    and rsi_falling):
                 return "PE", "EMA_SCALP"
 
         return None, ""
